@@ -1,0 +1,408 @@
+---
+title: "Predictive models"
+author: "Jim Costello"
+date: "7/16/2024"
+output: html_document
+---
+
+#### Contents:
+
+* [Prepare the data](#data)
+* [Hierarchical Clustering](#hclust)
+* [Elastic net](#glmnet)
+* [Evaluation of Elastic Net](#evaluation)
+* [Random Forests](#randomforest)
+* [Session Information](#session)
+
+Note that you will need the following packages
+* caret
+* glmnet
+* reshape2
+* gplots
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(cluster)
+library(factoextra)
+library(ggfortify)
+library(ggplot2)
+library(glmnet)
+library(caret)
+library(limma)
+library(caTools)
+library(gplots)  
+library(reshape2)
+library(RCurl)
+library(randomForest)
+
+```
+
+
+
+<a name="data"/>
+
+### Load Metabolomics data and clinial information
+
+The data we will use were collected from individuals with and without Down sydrome. The samples are from blood plasma and metabolomics data were generated for each individual.
+
+
+
+```{r, message=F}
+
+# read in the raw metabolomics data
+x <- getURL("https://raw.githubusercontent.com/DS3-2024/Visualize_Cluster_HTP/main/data/P4C_LCMS_abundance_wide_011722.csv")
+mets <- read.csv(text = x, row.names = 1, header = T)
+dim(mets)
+row.names(mets)
+colnames(mets)
+
+#read in the metadata
+x <- getURL("https://raw.githubusercontent.com/DS3-2024/Visualize_Cluster_HTP/main/data/P4C_metadata_011722.csv")
+info <- read.csv(text = x, row.names = 1, header = T)
+dim(info)
+colnames(info)
+
+# make sure the patient order matches in both the meta data and the metabolimcs data
+patients <- intersect(row.names(mets), row.names(info))
+length(patients)
+mets <- mets[patients,]
+info <- info[patients,]
+mets <- mets[order(info$Karyotype),]
+info <- info[order(info$Karyotype),]
+
+# remove the batch effect of sample source where the samples were collected
+mets <- 2^t((removeBatchEffect(t(log2(mets)), batch=info$Sample_source)))
+
+
+info$order <- seq(1,nrow(info))
+info$Karyotype <- as.factor(info$Karyotype)
+mets.info <- cbind(log2(mets), info)
+
+# use PCA to remove a few outlier samples
+pca <- prcomp(na.omit(mets), scale=T)
+mets <- mets[pca$x[,1] < 15,]
+info <- info[pca$x[,1] < 15,]
+mets.info <- cbind(mets, info)
+dim(mets)
+pca <- prcomp(na.omit(mets), scale=T)
+```
+
+---
+
+<a name="hclust"/>
+
+### Hierarchical Clustering
+
+Note: Make sure you install the `hclust` package in R. Some of the code is taken from this nice [tutorial post](https://bradleyboehmke.github.io/HOML/hierarchical.html) on hierarchical clustering. 
+
+```{r, message = F, warning = F}
+
+# we will first perform agglomerative hierachical clustering (bottom up) using the agnes function in the cluster package
+
+# test the various linkage methods to see which provides the strongest clusters
+#define linkage methods
+m <- c( "average", "single", "complete", "ward")
+names(m) <- c( "average", "single", "complete", "ward")
+
+#function to compute agglomerative coefficient
+ac <- function(x) {
+  agnes(scale(mets), method = x)$ac
+}
+
+#calculate agglomerative coefficient for each clustering linkage method
+sapply(m, ac)
+
+#generate the agglomerative clustering and perform some visualizations
+ac <- agnes(scale(mets), method="ward")
+plot(as.hclust(ac), cex=0.3, main="Dendrogram for AGNES")
+rect.hclust(ac, k = 4, border = 2:5)
+
+# lets see how we can determine the appropriate cluster size
+
+# The total within-cluster sum of square (wss) measures the compactness of the clustering and we want it to be as small as possible. 
+p1 <- fviz_nbclust(scale(mets), FUN = hcut, method = "wss", 
+                   k.max = 10) +
+  ggtitle("(A) Elbow method")
+# silhouette method determines how well each object lies within its cluster. A high average silhouette width indicates a good clustering.
+p2 <- fviz_nbclust(scale(mets), FUN = hcut, method = "silhouette", 
+                   k.max = 10) +
+  ggtitle("(B) Silhouette method")
+# The gap statistic compares the total intracluster variation for different values of k with their expected values under null reference distribution of the data (i.e. a distribution with no obvious clustering). The reference dataset is generated using Monte Carlo simulations of the sampling process.
+p3 <- fviz_nbclust(scale(mets), FUN = hcut, method = "gap_stat", 
+                   k.max = 10) +
+  ggtitle("(C) Gap statistic")
+gridExtra::grid.arrange(p1, p2, p3, nrow = 1)
+
+
+# lets see where the clusters fall in PCA space
+mets.info$agnesclusters <- as.factor(cutree(ac, k=5))
+autoplot(pca, data=mets.info, col='agnesclusters')
+
+
+# we will next perform divisive hierarchical clustering (top down) using the diana function in the cluster package
+di <- diana(scale(mets))
+di$dc
+plot(as.hclust(di), cex=0.3, main="Dendrogram for DIANA")
+
+mets.info$dianaclusters <- as.factor(cutree(di, k=5))
+autoplot(pca, data=mets.info, col='dianaclusters')
+
+
+```
+
+
+<a name="glmnet"/>
+
+### Linear Models
+
+Note: Make sure you install the `glmnet` package in R. We will use this for all examples of Ridge, Lasso and elastic net regression.
+
+```{r, message = F, warning = F}
+
+# we will predict on BMI, so remove individuals without any BMI information.
+mets.info <- mets.info[!is.na(mets.info$BMI),]
+
+######## Organize the data for fitting linear models:
+response = mets.info$BMI
+
+# Define cutoffs. We will use standard BMI scales to define normal, overweight, obese
+normal.cutoff =  25  
+obese.cutoff = 30
+
+# Append response variable to matrix 
+mets.info$Response = ifelse(response >= obese.cutoff, 'obese',
+                          ifelse(response <= normal.cutoff, 'normal', 'overweight'))
+
+# Save group sizes for comparison
+tab = table(mets.info$Response)
+
+# Check plot to make sure our cutoffs look reasonable
+group.colors = ifelse(mets.info$Response == 'obese', 'blue',
+                      ifelse(mets.info$Response == 'normal', 'red', 'black'))
+
+plot(response, col = group.colors, pch = 16,
+     main = 'BMI across the HTP cohort', 
+     xlab = 'Individuals',
+     ylab = 'BMI')
+legend('topright', pch = 16, col = c('red', 'blue', 'black'),
+       legend = c(paste0(sprintf('Normal (n = %d)', tab['normal'])), 
+                  paste0(sprintf('Obese (n = %d)', tab['obese'])), 
+                  paste0(sprintf('Overweight (n = %d)', tab['overweight']))))
+
+# Filter out the overweight and make the two responses a factor
+mets.info = mets.info[mets.info$Response != 'overweight',]
+mets.info$Response = factor(mets.info$Response)
+table(mets.info$Response)
+
+
+# Define train and test sets
+mets <- mets.info[,1:174]
+mets <- cbind(mets,Response=mets.info$Response)
+individuals = row.names(mets)
+train.percent = .75
+inTrain = individuals %in% sample(individuals, floor(train.percent*length(individuals)))
+train.data = mets[inTrain,]
+test.data = mets[!inTrain,]
+
+# Make sure we have enough of each group in test set
+table(test.data$Response)
+
+```
+
+
+---
+
+#### Example 1 - Ridge regression
+
+```{r message = F, warning = F}
+
+#install.packages("glmnet")
+library(glmnet)
+
+# Make feature matrix and response vector
+feature.matrix = as.matrix(train.data[,-ncol(train.data)])  # Exclude the last column (Response)
+response.vector = train.data$Response
+
+# Fit linear Ridge regression model
+ridge.fit = glmnet(x = feature.matrix,      # features = all metabolites
+                   y = response.vector,     # binary  response
+                   family = 'binomial',     # we are doing binary classification
+                   alpha = 0)               # alpha = 0 is the Ridge penalty
+
+# Use the fit model to predict on the testing data
+testing.matrix= as.matrix(test.data[,1:174]) # Exclude the last column (Response)
+testing.response = test.data[,175]
+ridge.preds = predict(ridge.fit, newx = testing.matrix, type = 'class')
+
+# Take a look at how our model did
+table(Predicted_Group = ridge.preds[,ncol(ridge.preds)], 
+      Actual_Group = test.data$Response)
+
+ReportPerfMetrics = function(predicted.labels, true.labels, pos.class){
+  # Calculate the accuracy, precision and recall for two-class prediction
+  tp = sum(true.labels == pos.class & predicted.labels == pos.class)
+  fp = sum(true.labels != pos.class & predicted.labels == pos.class)
+  tn = sum(true.labels != pos.class & predicted.labels != pos.class)
+  fn = sum(true.labels == pos.class & predicted.labels != pos.class)
+  n = tp + fp + tn + fn
+  
+  accuracy = (tp + tn)/n
+  precision = tp/(tp + fp)
+  recall = tp/(tp + fn)
+  
+  return(list(Accuracy = accuracy, Precision = precision, Recall = recall))
+}
+
+ridge.metrics = ReportPerfMetrics(ridge.preds[,ncol(ridge.preds)], test.data$Response, 'obese')
+ridge.metrics
+
+```
+
+---
+
+#### Example 2 - Lasso regression
+
+```{r, message = F, warning = F}
+
+# Fit linear Lasso regression model
+lasso.fit = glmnet(x = feature.matrix,      # features = all metabolites
+                   y = response.vector,     # binary response
+                   family = 'binomial',     # we are doing binary classification
+                   alpha = 1)               # alpha = 1 is the Lasso penalty
+
+# Use the fit model to predict on the testing data
+lasso.preds = predict(lasso.fit, newx = testing.matrix, type = 'class')
+
+# Take a look at how our model did
+table(Predicted_Group = lasso.preds[,ncol(lasso.preds)], 
+      Actual_Group = test.data$Response)
+lasso.metrics = ReportPerfMetrics(lasso.preds[,ncol(lasso.preds)], test.data$Response, 'obese')
+lasso.metrics
+
+#lets compare lasso and ridge coefficients
+plot(lasso.fit, xvar="lambda", label=T)
+plot(ridge.fit, xvar = "lambda", label = TRUE)
+
+```
+
+---
+
+#### Example 3 - Elastic net regression with cross-validation
+
+```{r, message = F, warning = F}
+
+# Fit elastic net model
+elastic.fit = cv.glmnet(x = feature.matrix,      # features = all metabolites
+                   y = response.vector,          # binary response
+                   family = 'binomial',          # we are doing binary classification
+                   nfolds = 5,
+                   type.measure = 'auc',
+                   alpha = 0.5)
+
+# Use the fit model to predict on the testing data
+elastic.preds = predict(elastic.fit, newx = testing.matrix, type = 'class')
+
+# Take a look at how our model did
+elastic.metrics = ReportPerfMetrics(elastic.preds[,ncol(elastic.preds)], test.data$Response, 'obese')
+table(Predicted_Group = elastic.preds[,ncol(elastic.preds)], 
+      Actual_Group = test.data$Response)
+
+# Plot the cross-validation curve, and upper and lower standard deviation curves, as a function of the lambda values used
+plot(elastic.fit)
+
+```
+  
+---
+
+<a name="evaluation"/>
+
+### Sparse Linear Regression Evaluation
+
+For discussion on the alpha and lambda parameters, check out this [review of `glmnet` and elastic net regression](http://www.moseslab.csb.utoronto.ca/alan/glmnet_presentation.pdf).
+
+```{r, message = F, warning = F}
+# Compare the 3 examples, alpha = 0, alpha = 1, and alpha = 0.5
+results = cbind(Ridge = ridge.metrics, Lasso = lasso.metrics, ElasticNet = elastic.metrics)
+results
+
+######### Find optimal alpha and lambda with caret cross-validation
+library(caret)
+
+# Construct object for holding training parameters
+my.train.control = trainControl(method = "repeatedcv", number = 5, returnResamp = "all")
+
+# Train an elastic net model with varying alpha and lambda
+model = train(Response ~ ., data = train.data, 
+               method = "glmnet",                                        # Fit an elastic net model
+               metric = "Accuracy",                                      # Use accuracy as the loss for cross validation
+               tuneGrid = expand.grid(.alpha = seq(0, .5, by = .05),     # Try these alpha values
+                                      .lambda = seq(0, 1, by = .05)),    # And these lambda values
+               trControl = my.train.control)
+model
+
+# Reshape the data into a matrix for making a heatmap
+model.results = model$results
+model.cast = dcast(model.results, alpha ~ lambda, value.var = 'Accuracy')
+row.names(model.cast) = model.cast$alpha
+model.cast$alpha = NULL
+
+# Make a heatmap of the alphas and lambdas
+my.palette <- colorRampPalette(c("blue", "red"))(n = 100)
+heatmap.2(as.matrix(model.cast), 
+          col = my.palette,           # Define heatmap colors
+          Rowv = F, Colv = F,         # Don't cluster/reorder rows or columns
+          dendrogram = 'none',        # Don't plot dendrogram
+          trace = 'none',             # Don't draw trace lines
+          density.info = 'none',      # Don't draw histogram on color key
+          key.xlab = 'ROC',           # Label the color key
+          main = 'Optimizing alpha and lambda values',
+          xlab = 'Lambda values',
+          ylab = 'Alpha values')             
+
+```
+---
+<a name="randomforest"/>
+
+### Random Forest
+
+This is a nice reference for the basics on the [Random Forest](https://www.simplilearn.com/tutorials/data-science-tutorial/random-forest-in-r). You can also review the [Statquest](https://www.youtube.com/watch?v=J4Wdy0Wc_xQ&t=1s) on Random Forests.
+
+```{r, message = F, warning = F}
+
+# Fitting Random Forest to the train dataset 
+set.seed(120)  # Setting seed 
+classifier_RF = randomForest(x = feature.matrix, 
+                             y = response.vector, 
+                             ntree = 500) 
+classifier_RF 
+  
+# Predicting the Test set results 
+y_pred = predict(classifier_RF, newdata = testing.matrix) 
+  
+# Confusion Matrix 
+confusion_mtx = table(testing.response, y_pred) 
+confusion_mtx 
+  
+# Plotting model 
+plot(classifier_RF) 
+legend("topright", legend=colnames(classifier_RF$err.rate), fill=c("black", "red", "green"))
+  
+# Importance plot 
+importance(classifier_RF) 
+  
+# Variable importance plot 
+varImpPlot(classifier_RF) 
+```
+---
+
+<a name="session"/>
+
+### Session Information
+
+```{r, message = F}
+sessionInfo()
+```
+
+
